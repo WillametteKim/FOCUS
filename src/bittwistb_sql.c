@@ -1,0 +1,717 @@
+/*
+기존의 bittwistb.c 파일을 우리 팀의 필요에 맞게 수정한 파일이다.
+기본적으로  LEDE와 서버사이의 패킷을 send_packets 함수를 통해 보내주는 역할을 한다.
+send_packets 함수를 호출하기 전에, 패킷들을 DB에 담는 코드가 추가되었고,
+list.db에 있는 차단 리스트를 보고 목적지 IP를 비교하여 패킷을 전하지 않는 기능을 추가했다.
+ */
+#include "thread.h"
+#include "bittwistb.h"
+#include<sqlite3.h>
+
+char *program_name = "what is it?";
+char *zErrMsg;
+char *sql_create;
+char *sql_insert;
+
+char *sql_select;
+char ebuf[PCAP_ERRBUF_SIZE]; /* pcap error buffer */
+int vflag = 0; /* 1 - print source and destination MAC for forwarded packets */
+
+pcap_t *pd[PORT_MAX]; /* array of pcap descriptors for all interfaces */
+int pd_count = 0; /* number of pcap descriptors created */
+
+struct bridge_ht bridge_ht[HASH_SIZE]; /* hash table to store bridge_ht structures */
+struct ether_addr *bridge_addr[PORT_MAX]; /* storage for local MAC */
+
+/* Ethernet broadcast MAC address */
+const u_char ether_bcast[ETHER_ADDR_LEN] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+};
+
+/* stats */
+static u_int pkts_sent = 0;
+static u_int bytes_sent = 0;
+static u_int failed = 0;
+struct timeval start = {0,0};
+struct timeval end = {0,0};
+
+
+
+static int callback(void *NotUsed, int argc, char **argv, char **azColName){
+
+   return 0;
+}
+// 필터링 된 IP 정보를 확인하는 sqlite 콜백 함수.
+static int callback_filter_ip(void* ip, int argc, char **argv, char **azColName){
+   struct check_ip* s_ip = (struct check_ip *)ip;
+
+   if(s_ip->flag != 0){
+     if(!strcmp(s_ip->ip, argv[0])){
+       s_ip->flag = 0;
+     } else{
+       s_ip->flag = 1;
+     }
+   }
+   return 0;
+}
+// 필터링 된 PORT 정보를 확인하는 sqlite 콜백 함수.
+static int callback_filter_port(void* port, int argc, char **argv, char **azColName){
+  struct check_port* s_port = (struct check_port *)port;
+
+  if(s_port->flag != 0){
+    if((int)s_port->port == atoi(argv[0])){
+      s_port->flag = 0;
+    //  printf("%d\n", s_port->flag);
+    } else{
+      s_port->flag = 1;
+    }
+  }
+  return 0;
+}
+void* bittwist()
+{
+	char* cp;
+	int c;
+  pcap_if_t *devptr;
+  int i, j;
+  char devices[] = "eth0,eth1";
+    /* process options */
+    ++vflag;
+
+    cp = strtok(devices, ",");
+    i = 0;
+    while (cp != NULL) {
+        if (i >= PORT_MAX)
+            error("invalid interfaces specification");
+
+        /* empty error buffer to grab warning message (if exist) from pcap_open_live() below */
+        *ebuf = '\0';
+
+        /* create a pcap descriptor for each interface to capture packets */
+        pd[i] = pcap_open_live(cp,
+                               ETHER_MAX_LEN, /* portion of packet to capture */
+                               1,             /* promiscuous mode is on */
+                               1,             /* read timeout, in milliseconds */
+                               ebuf);
+        if (pd[i] == NULL)
+            error("%s", ebuf);
+        else if (*ebuf)
+            notice("%s", ebuf); /* warning message from pcap_open_live() above */
+
+        bridge_addr[i] = (struct ether_addr *)malloc(sizeof(struct ether_addr));
+        if (bridge_addr[i] == NULL)
+            error("malloc(): cannot allocate memory for bridge_addr[%d]", i);
+
+        /* copy MAC address for cp into bridge_addr[i] */
+        if (gethwaddr(bridge_addr[i], cp) == -1)
+            error("gethwaddr(): cannot locate hardware address for %s", cp);
+
+        if (vflag > 0) {
+            // (void)printf("%s=", cp);
+            for (j = 0; j < ETHER_ADDR_LEN; j++) {
+                // (void)printf("%02x", bridge_addr[i]->octet[j]);
+                // j == (ETHER_ADDR_LEN - 1) ? (void)putchar(',') : (void)putchar(':');
+            }
+            // (void)printf("port=%d\n", i + 1);
+        }
+
+        cp = (char *)strtok(NULL, ",");
+        ++i;
+    }
+    if (i < PORT_MIN)
+        error("invalid interfaces specification");
+    pd_count = i; /* number of pcap descriptors that we have actually created */
+
+    /* set signal handler for SIGINT (Control-C) */
+    (void)signal(SIGINT, cleanup);
+
+    if (gettimeofday(&start, NULL) == -1)
+        notice("gettimeofday(): %s", strerror(errno));
+
+    bridge_on(); /* run bridge */
+
+    exit(EXIT_SUCCESS);
+}
+
+void bridge_on(void)
+{
+    /*
+     * struct pollfd {
+     *     int    fd;      -> file descriptor
+     *     short  events;  -> events to look for
+     *     short  revents; -> events returned
+     * };
+     */
+    struct pollfd pcap_poll[pd_count]; /* to poll initialized pd */
+    int poll_ret = 0; /* return code for poll() */
+    int ret;
+    int i;
+    sigset_t block_sig;
+
+    (void)sigemptyset(&block_sig);
+    (void)sigaddset(&block_sig, SIGALRM);
+
+    /*
+     * we are interested only on these event bitmasks:
+     * POLLIN = Data other than high priority data may be read without blocking
+     * POLLPRI = High priority data may be read without blocking
+     */
+    for (i = 0; i < pd_count; i++) {
+        pcap_poll[i].fd = pcap_fileno(pd[i]);
+        pcap_poll[i].events = POLLIN | POLLPRI;
+        pcap_poll[i].revents = 0;
+    }
+
+    /*
+     * set signal handler for SIGALRM, generated by setitimer() in hash_alarm(),
+     * to remove old hash entries from the hash table
+     */
+    (void)signal(SIGALRM, hash_alarm_handler);
+
+    /* set alarm for the first time */
+    if (hash_alarm(HASH_ALARM) == -1)
+        error("setitimer(): %s", strerror(errno));
+
+    while (1) { /* run infinitely until user Control-C */
+        /* we do not want to interrupt the polling -> hold SIGALRM */
+        (void)sigprocmask(SIG_BLOCK, &block_sig, NULL);
+
+        /* poll for a packet on all the initialized pd */
+        poll_ret = poll(pcap_poll,  /* array of pollfd structures */
+                        pd_count,   /* size of pcap_poll array */
+                         1);         /* timeout, in milliseconds */
+
+        /* release SIGALRM */
+        (void)sigprocmask(SIG_UNBLOCK, &block_sig, NULL);
+
+        /* we have got packet(s) from one or more of the initialized pd */
+        if (poll_ret > 0) {
+            for (i = 0; i < pd_count; i++) {
+                if (pcap_poll[i].revents > 0) {
+                    ret = pcap_dispatch(pd[i],                    /* pcap descriptor */
+                                        -1,                       /* -1 -> process all packets */
+                                        (pcap_handler)bridge_fwd, /* callback function */
+                                        (u_char *)(i + 1));       /* LAN segment or port (first port is 1 not 0) */
+                    /* ret = number of packets read */
+                    if (ret == 0)
+                        /* we came in from poll(), timeout is unlikely */
+                        notice("pcap_dispatch(): read timeout");
+                    else if (ret == -1)
+                        notice("%s", pcap_geterr(pd[i]));
+                }
+            }
+        }
+        else if (poll_ret == 0) {
+            /* we do not want to print this during normal use! */
+            /* notice("poll(): time limit expires"); */
+         }
+         else {
+             notice("poll(): %s", strerror(errno));
+         }
+
+         /* reset events */
+         for (i = 0; i < pd_count; i++)
+             pcap_poll[i].revents = 0;
+     }
+ }
+
+ void bridge_fwd(u_char *port, const struct pcap_pkthdr *header, const u_char *pkt_data)
+ {
+     /*
+      * Ethernet header (14 bytes)
+      * 1. destination MAC (6 bytes)
+      * 2. source MAC (6 bytes)
+      * 3. type (2 bytes)
+       */
+       int check_ip_val;
+       int check_port_val;
+       int state = 1;
+    	u_char *ptr;
+	struct ip *iph;
+	struct tcphdr* th;
+	struct udphdr* uh;
+	int src_port = 0;
+	int dst_port = 0;
+	char src_mac[20];
+	char dst_mac[20];
+     struct ether_header *eth_hdr;
+     int index; /* hash table index */
+     int i;
+     int new_hash_entry = 0; /* set to 1 if we have new hash entry */
+     int outport = 0; /* port on which this packet will depart */
+     /*
+      * port on which the host with source MAC address for this packet resides on, this
+      * value may be different with port (first argument of this function) if this packet
+      * is departing from an interface when it was captured
+      */
+     int sport = 0;
+
+     /* do nothing if Ethernet header is truncated */
+     if (header->caplen < ETHER_HDR_LEN)
+         return;
+
+     eth_hdr = (struct ether_header *)malloc(ETHER_HDR_LEN);
+     if (eth_hdr == NULL)
+         error("malloc(): cannot allocate memory for eth_hdr");
+
+     /* copy Ethernet header from pkt_data into eth_hdr */
+     memcpy(eth_hdr, pkt_data, ETHER_HDR_LEN);
+	ptr = eth_hdr->ether_dhost;
+	 sprintf(dst_mac,"%02X%02X%02X%02X%02X%02X",ptr[0],ptr[1],ptr[2],ptr[3],ptr[4],ptr[5]);
+	ptr = eth_hdr -> ether_shost;
+	 sprintf(src_mac,"%02X%02X%02X%02X%02X%02X",ptr[0],ptr[1],ptr[2],ptr[3],ptr[4],ptr[5]);
+     /* BEGIN BRIDGE LEARNING SECTION */
+     index = HASH_FUNC(eth_hdr->ether_shost); /* hash source MAC */
+
+     /* found an entry in hash table @ index */
+     if (bridge_ht[index].port != 0) {
+         /* collision -> override previous bridge_ht structure @ index in hash table */
+         if (!ETHER_ADDR_EQ(&bridge_ht[index].etheraddr, eth_hdr->ether_shost))
+             new_hash_entry = 1;
+
+         /* port on which the host with source MAC address for this packet resides on */
+         sport = bridge_ht[index].port;
+     }
+     /* nothing @ index of hash table -> store our new bridge_ht structure there */
+     else {
+         new_hash_entry = 1;
+     }
+
+     /* store a new hash entry */
+     if (new_hash_entry) {
+         /* copy source MAC from eth_hdr into bridge_ht[index] */
+         memcpy(&bridge_ht[index].etheraddr, eth_hdr->ether_shost, ETHER_ADDR_LEN);
+
+         /* port on which source MAC resides on */
+         bridge_ht[index].port = (int)port;
+
+         /* set a timeout for this entry in units of HASH_ALARM in seconds */
+         bridge_ht[index].timeout = HASH_TIMEOUT;
+
+         if (vflag > 0) {
+            //  (void)printf("[%06d]mac=", index);
+            //  for (i = 0; i < ETHER_ADDR_LEN; i++) {
+                //  (void)printf("%02x", eth_hdr->ether_shost[i]);
+                //  i == (ETHER_ADDR_LEN - 1) ? (void)putchar(',') : (void)putchar(':');
+            //  }
+            //  (void)printf("port=%d\n", bridge_ht[index].port);
+         }
+     }
+     /* END BRIDGE LEARNING SECTION */
+
+     /* check if destination MAC is local MAC */
+     for (i = 0; i < pd_count; i++) {
+         if (ETHER_ADDR_EQ(bridge_addr[i]->octet, eth_hdr->ether_dhost)) {
+             free(eth_hdr); eth_hdr = NULL;
+             return;
+         }
+     }
+
+     /* BEGIN BRIDGE FORWARDING SECTION */
+     /* broadcast packet */
+     if (ETHER_ADDR_EQ(eth_hdr->ether_dhost, ether_bcast)) {
+         /* forward packet out through all ports except the port on which this packet arrives */
+         outport = -(int)port;
+     }
+     /* multicast packet */
+     else if (ETHER_IS_MULTICAST(eth_hdr->ether_dhost)) {
+         /* forward packet out through all ports except the port on which this packet arrives */
+         outport = -(int)port;
+     }
+     /* unicast packet */
+     else {
+     index = HASH_FUNC(eth_hdr->ether_dhost); /* hash destination MAC */
+
+     /* nothing @ index in hash table -> we have no information on destination MAC */
+     if (bridge_ht[index].port == 0) {
+             /* forward packet out through all ports except the port on which this packet arrives */
+             outport = -(int)port;
+     }
+     else {
+             /* source MAC in hash table matches destination MAC */
+             if (ETHER_ADDR_EQ(&bridge_ht[index].etheraddr, eth_hdr->ether_dhost)) {
+             /* do not forward packet within the same LAN segment */
+             if (bridge_ht[index].port == (int)port) {
+                     outport = 0;
+             }
+             /* forward packet out through bridge_ht[index].port */
+             else {
+                     outport = bridge_ht[index].port;
+             }
+             }
+             /* forward packet out through all ports except the port on which this packet arrives */
+             else {
+             outport = -(int)port;
+             }
+     }
+     }
+	// printf("=========IP HEADER========\n");
+
+		iph = (struct ip*)&pkt_data[14];
+		// printf("Source IP %s\n",inet_ntoa(iph->ip_src));
+		// printf("Destination IP %s\n\n",inet_ntoa(iph->ip_dst));
+
+		th = (struct tcphdr*)&pkt_data[34];
+		uh = (struct udphdr*)&pkt_data[34];
+
+		if(pkt_data[23] == IPPROTO_TCP){
+				// printf("=========TCP HEADER========\n");
+				dst_port = ntohs(th->th_dport);
+        //printf("dst : %d\n", (int)dst_port);
+		}
+
+		if(pkt_data[23] == IPPROTO_UDP){
+			// printf("=========UDP HEADER========\n");
+			// printf("Source port %d\n", ntohs(uh->uh_sport));
+			// printf("Dest port %d\n", ntohs(uh->uh_dport));
+			src_port = ntohs(uh->uh_sport);
+			dst_port = ntohs(uh->uh_dport);
+      //printf("src: %d, dst: %d\n", (int)src_port, (int)dst_port);
+
+		}
+
+check_ip_val = checkIP(inet_ntoa(iph->ip_dst));
+check_port_val = checkPort(dst_port);
+
+state = check_ip_val && check_port_val;
+
+int rc;
+sqlite3 *db;
+rc = sqlite3_open("packet.db", &db);
+
+   if( rc ){
+      fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+      return;
+   }else{
+      // fprintf(stderr, "Opened database successfully\n");
+   }
+
+	if(src_port != 0 ){
+    // if(!strcmp(dst_mac,"255.255.255.255"))
+		  sql_insert =  sqlite3_mprintf("INSERT INTO PACKET(SRC_MAC, DST_MAC, SRC_IP, DST_IP,SRC_PORT, DST_PORT, STATE) VALUES('%q','%q','%q','%q',%d,%d,%d)",src_mac,dst_mac,inet_ntoa(iph->ip_src), inet_ntoa(iph->ip_dst),src_port,dst_port, state);
+
+      rc = sqlite3_exec(db, sql_insert, callback, 0, &zErrMsg);
+
+		if(rc != SQLITE_OK)
+		{
+			sqlite3_free(zErrMsg);
+		}
+
+		sqlite3_free(sql_insert);
+	}
+ sqlite3_close(db);
+
+     if (state && (outport != 0)) {
+        //if(th->th_dport == 9991) printf("wow\n");
+         send_packets(outport,
+                      sport,
+                      (const struct ether_addr *)eth_hdr->ether_dhost,
+                      (const struct ether_addr *)eth_hdr->ether_shost,
+                      pkt_data, header->caplen);
+     }else if(outport == 0){}
+     else{
+       //printf("DENIED!!\n");
+     }
+     /* END BRIDGE FORWARDING SECTION */
+
+     free(eth_hdr); eth_hdr = NULL;
+     return;
+ }
+
+int checkIP(char* ip){  // ã�°�.
+   int rc;
+   sqlite3 *db;
+   struct check_ip s_ip = {ip, 1};
+
+   rc = sqlite3_open("list.db", &db);
+
+   if( rc ){
+      fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+      return(0);
+   }else{
+      // fprintf(stderr, "check Ip Opened database successfully\n");
+   }
+
+   sql_select = "SELECT IP FROM IP_LIST;";
+
+   /* Execute SQL statement */
+  pthread_mutex_lock(mutex); // ?�금???�성?�다.
+  rc = sqlite3_exec(db, sql_select, callback_filter_ip, (void*)&s_ip, &zErrMsg);
+  pthread_mutex_unlock(mutex); // ?�금???�제?�다.
+
+   if( rc != SQLITE_OK ){
+      sqlite3_free(zErrMsg);
+   }
+
+   sqlite3_close(db);
+
+  //  printf("flag = %d\n", s_ip.flag);
+   return s_ip.flag;
+}
+
+int checkPort(int port){
+   int rc;
+   sqlite3 *db;
+   struct check_port s_port = {port, 1};
+
+   rc = sqlite3_open("list.db", &db);
+
+   if( rc ){
+      fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+      return 0;
+   }else{
+      // fprintf(stderr, "Opened database successfully\n");
+   }
+   sql_select = "SELECT PORT FROM PORT_LIST;";
+
+
+   /* Execute SQL statement */
+   pthread_mutex_lock(mutex); // ?�금???�성?�다.
+  rc = sqlite3_exec(db, sql_select, callback_filter_port, (void*)&s_port, &zErrMsg);
+  pthread_mutex_unlock(mutex); // ?�금???�성?�다.
+
+   if( rc != SQLITE_OK ){
+      sqlite3_free(zErrMsg);
+   }
+
+   sqlite3_close(db);
+  // printf("port.flag : %d\n", s_port.flag);
+   return s_port.flag;
+}
+
+
+
+
+ void send_packets(int outport,
+                   int sport,
+                   const struct ether_addr *ether_dhost,
+                   const struct ether_addr *ether_shost,
+                   const u_char *pkt_data,
+                   int pkt_len)
+ {
+     int start, end;
+     int i, j;
+     int ret;
+     sigset_t block_sig;
+
+     (void)sigemptyset(&block_sig);
+     (void)sigaddset(&block_sig, SIGINT);
+
+     /*
+      * if port is a negative integer, the positive of it is the port
+      * on which this packet arrives
+      */
+     if (outport < 0) { /* send out through all ports except the port on which this packet arrives */
+         start = 0;
+         end = pd_count;
+     }
+     else { /* send out through the specified port only */
+         start = outport - 1;
+         end = outport;
+     }
+
+     (void)sigprocmask(SIG_BLOCK, &block_sig, NULL); /* hold SIGINT */
+
+     /* finish the injection before we give way to SIGINT */
+     for (i = start; i < end; i++) {
+         /*
+          * if we are forwarding this packet out through all ports, do not forward
+          * it back to the port on which this packet arrives
+          */
+         if ((outport < 0) && (i == (-outport - 1))) {
+             /* do nothing */
+         }
+         /*
+          * in addition to the port on which we received this packet, we also should not send this
+          * packet to the port on which the host with this source MAC address resides on
+          */
+         else if ((sport != 0) && (i == (sport - 1))) {
+             /* do nothing */
+         }
+         else {
+             if ((ret = pcap_inject(pd[i], pkt_data, pkt_len)) == -1) {
+                 notice("%s", pcap_geterr(pd[i]));
+                 ++failed;
+             }
+             else {
+                 if (vflag > 0) {
+                //  (void)printf("dmac=");
+                 for (j = 0; j < ETHER_ADDR_LEN; j++) {
+                    //  (void)printf("%02x", ether_dhost->octet[j]);
+                    //  j == (ETHER_ADDR_LEN - 1) ? (void)putchar(',') : (void)putchar(':');
+                 }
+                //  (void)printf("smac=");
+                 for (j = 0; j < ETHER_ADDR_LEN; j++) {
+                    //  (void)printf("%02x", ether_shost->octet[j]);
+                    //  j == (ETHER_ADDR_LEN - 1) ? (void)putchar(',') : (void)putchar(':');
+                 }
+                    //  (void)printf("outport=%d\n", i + 1);
+                 }
+                 ++pkts_sent;
+                 bytes_sent += ret;
+             }
+         }
+     }
+
+     (void)sigprocmask(SIG_UNBLOCK, &block_sig, NULL); /* release SIGINT */
+ }
+
+ void hash_alarm_handler(int signum)
+ {
+     int i;
+
+     for (i = 0; i < HASH_SIZE; i++) {
+         if ((bridge_ht[i].port != 0) && (--bridge_ht[i].timeout < 0)) {
+             bridge_ht[i].port = 0;
+             if (vflag > 0){}
+                //  (void)printf("[%06d]deleted\n", i);
+         }
+     }
+
+     /* reset alarm */
+     if (hash_alarm(HASH_ALARM) == -1)
+         error("setitimer(): %s", strerror(errno));
+ }
+
+ int hash_alarm(unsigned int seconds)
+ {
+     struct itimerval old, new;
+
+     new.it_interval.tv_usec = 0;
+     new.it_interval.tv_sec = 0;
+     new.it_value.tv_usec = 0;
+     new.it_value.tv_sec = (long)seconds;
+
+     return (setitimer(ITIMER_REAL, &new, &old));
+ }
+
+ /*
+  * looks like BSD does not have SIOCGIFHWADDR,
+  * let me know if you have a portable gethwaddr(), i.e. works for both BSD and Linux systems
+  */
+ #ifndef SIOCGIFHWADDR
+ /*
+  * Reference: getmac.c from bridged by Keisuke Uehara(kei@wide.ad.jp)
+  *
+  * Copyright(c) 1999
+  * Keisuke UEHARA(kei@wide.ad.jp)
+  * All rights reserved.
+  *
+  *
+  * Copyright(c) 1998,1999
+  * Masahiro ISHIYAMA(masahiro@isl.rdc.toshiba.co.jp)
+  * All rights reserved.
+  *
+  */
+ #define ALLSET(flag, bits) (((flag) & (bits)) == (bits))
+ int gethwaddr(struct ether_addr *ether_addr, char *device)
+ {
+     struct ifaddrs *ifa, *ifap;
+     struct sockaddr_dl *sdl;
+
+     if (getifaddrs(&ifap) < 0)
+         return (-1);
+
+     for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+         if (strcmp(device, ifa->ifa_name) != 0)
+             continue;
+         if (!ALLSET(ifa->ifa_flags, IFF_UP | IFF_BROADCAST))
+             continue;
+         if (ifa->ifa_addr->sa_family != AF_LINK)
+             continue;
+
+         sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+         bcopy(LLADDR(sdl), ether_addr, ETHER_ADDR_LEN);
+         freeifaddrs(ifap);
+         return (0);
+     }
+
+     freeifaddrs(ifap);
+     return (-1);
+ }
+ #else
+ /* works for Linux */
+ int gethwaddr(struct ether_addr *ether_addr, char *device)
+ {
+     struct ifreq ifr;
+     int fd;
+
+     if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) != -1) {
+         strcpy(ifr.ifr_name, device);
+         if (ioctl(fd, SIOCGIFHWADDR, &ifr) != -1) {
+             bcopy(&ifr.ifr_hwaddr.sa_data, ether_addr, ETHER_ADDR_LEN);
+             return (0);
+         }
+     }
+
+     return (-1);
+ }
+ #endif
+
+ void info(void)
+ {
+     struct timeval elapsed;
+     float seconds;
+
+     if (gettimeofday(&end, NULL) == -1)
+         notice("gettimeofday(): %s", strerror(errno));
+     timersub(&end, &start, &elapsed);
+     seconds = elapsed.tv_sec + (float)elapsed.tv_usec / 10;
+
+     (void)putchar('\n');
+     notice("%u packets (%u bytes) sent", pkts_sent, bytes_sent);
+     if (failed)
+         notice("%u write attempts failed", failed);
+     notice("Elapsed time = %f seconds", seconds);
+ }
+
+ void cleanup(int signum)
+ {
+     if (signum == -1)
+         exit(EXIT_FAILURE);
+     else
+         info();
+     exit(EXIT_SUCCESS);
+ }
+
+ /*
+  * Reference: tcpdump's util.c
+  *
+  * Copyright (c) 1990, 1991, 1993, 1994, 1995, 1996, 1997
+  *      The Regents of the University of California.  All rights reserved.
+  *
+  */
+ void notice(const char *fmt, ...)
+ {
+     va_list ap;
+     va_start(ap, fmt);
+     (void)vfprintf(stderr, fmt, ap);
+     va_end(ap);
+     if (*fmt) {
+         fmt += strlen(fmt);
+         if (fmt[-1] != '\n')
+             (void)fputc('\n', stderr);
+     }
+ }
+
+ /*
+  * Reference: tcpdump's util.c
+  *
+  * Copyright (c) 1990, 1991, 1993, 1994, 1995, 1996, 1997
+  *      The Regents of the University of California.  All rights reserved.
+  *
+  */
+ void error(const char *fmt, ...)
+ {
+     va_list ap;
+     (void)fprintf(stderr, "%s: ", program_name);
+     va_start(ap, fmt);
+     (void)vfprintf(stderr, fmt, ap);
+     va_end(ap);
+     if (*fmt) {
+         fmt += strlen(fmt);
+         if (fmt[-1] != '\n')
+             (void)fputc('\n', stderr);
+     }
+     cleanup(-1);
+ }

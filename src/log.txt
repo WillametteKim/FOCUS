@@ -1,0 +1,6 @@
+Audio codec mp3 channels 1 samplerate 11025 bitspersample 16
+Subtitle count: 0, state: off, index: 1, delay: 0
+have a nice day ;)
+Audio codec mp3 channels 1 samplerate 11025 bitspersample 16
+Subtitle count: 0, state: off, index: 1, delay: 0
+have a nice day ;)
